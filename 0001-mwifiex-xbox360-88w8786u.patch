@@ -1,0 +1,317 @@
+From: linux-xenon maintainers
+Subject: [PATCH] mwifiex: support the Xbox 360 88W8786U USB module
+
+The Xbox Slim/E Marvell 88W8786U enumerates as 045e:0765 and runs the
+firmware stored on its own flash; no firmware file is loaded.
+
+- usb: add the ID; detect boot ROM vs running firmware with a framed
+  FUNC_INIT, and boot the ROM with the 16-byte "MRVL" message
+- usb: the ID never changes after boot, so go straight to runtime
+- main: allow adapters without a firmware file (no_fw_file)
+- usb: legacy scan only (no extended scan)
+- sta_cmd, cfg80211: firmware lacks STA power save, auto deep sleep and
+  SET_BSS_MODE; warn and continue instead of failing init
+
+--- a/drivers/net/wireless/marvell/mwifiex/usb.c
++++ b/drivers/net/wireless/marvell/mwifiex/usb.c
+@@ -18,6 +18,8 @@
+ 	{USB_DEVICE_AND_INTERFACE_INFO(USB8XXX_VID, USB8766_PID_2,
+ 				       USB_CLASS_VENDOR_SPEC,
+ 				       USB_SUBCLASS_VENDOR_SPEC, 0xff)},
++	/* Xbox 360 Marvell 88W8786U firmware-download and runtime IDs. */
++	{USB_DEVICE(MS_XBOX_VID, USB8786_PID_1)},
+ 	/* 8797 */
+ 	{USB_DEVICE(USB8XXX_VID, USB8797_PID_1)},
+ 	{USB_DEVICE_AND_INTERFACE_INFO(USB8XXX_VID, USB8797_PID_2,
+@@ -407,6 +409,7 @@
+ 	/* PID_1 is used for firmware downloading only */
+ 	switch (id_product) {
+ 	case USB8766_PID_1:
++	case USB8786_PID_1:
+ 	case USB8797_PID_1:
+ 	case USB8801_PID_1:
+ 	case USB8997_PID_1:
+@@ -1319,6 +1322,13 @@
+ 		strcpy(adapter->fw_name, USB8766_DEFAULT_FW_NAME);
+ 		adapter->ext_scan = true;
+ 		break;
++	case USB8786_PID_1:
++		adapter->tx_buf_size = MWIFIEX_TX_DATA_BUF_SIZE_2K;
++		/* runs its own flash firmware: no firmware file needed */
++		adapter->no_fw_file = true;
++		/* this firmware only supports the legacy scan command */
++		adapter->ext_scan = false;
++		break;
+ 	case USB8801_PID_1:
+ 	case USB8801_PID_2:
+ 		adapter->tx_buf_size = MWIFIEX_TX_DATA_BUF_SIZE_2K;
+@@ -1512,12 +1522,130 @@
+ 	return ret;
+ }
+ 
++/* Xbox 360 88W8786U: the console boots the adapter's own flash firmware by
++ * sending a 16-byte "MRVL" message from boot ROM mode; the adapter answers
++ * with an 8-byte ack and then an EVENT_INIT_DONE event. No image is sent.
++ * Both states report the same USB descriptors. A framed FUNC_INIT tells
++ * them apart: the boot ROM answers with 8 bytes (first word 1), running
++ * firmware with a 0xF00DFACE command response (or a pending event).
++ * Never send MRVL or a bare packet to running firmware: it wedges its pipe.
++ */
++#define XBOX_MRVL_MSG_LEN	16
++#define XBOX_EVENT_INIT_DONE	0x00000007
++
++static int mwifiex_usb_xbox_probe(struct mwifiex_adapter *adapter)
++{
++	__le32 *buf;
++	u32 len, type;
++	int ret, i;
++
++	buf = kzalloc(FW_DNLD_RX_BUF_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	buf[0] = cpu_to_le32(MWIFIEX_USB_TYPE_CMD);
++	buf[1] = cpu_to_le32(HostCmd_CMD_FUNC_INIT | (8 << 16));
++	buf[2] = cpu_to_le32(1);
++	len = 12;
++	ret = mwifiex_write_data_sync(adapter, (u8 *)buf, &len,
++				      MWIFIEX_USB_EP_CMD_EVENT, 1000);
++	if (ret)
++		goto out;
++
++	ret = -ETIMEDOUT;
++	for (i = 0; i < 3; i++) {
++		len = FW_DNLD_RX_BUF_SIZE;
++		if (mwifiex_read_data_sync(adapter, (u8 *)buf, &len,
++					   MWIFIEX_USB_EP_CMD_EVENT, 2000))
++			break;
++		type = le32_to_cpu(buf[0]);
++		if (type == MWIFIEX_USB_TYPE_CMD ||
++		    type == MWIFIEX_USB_TYPE_EVENT) {
++			ret = 0;	/* running firmware */
++			break;
++		}
++		if (len == 8 && type == 1) {
++			ret = 1;	/* boot ROM */
++			break;
++		}
++	}
++out:
++	kfree(buf);
++	return ret;
++}
++
++static int mwifiex_usb_xbox_boot(struct mwifiex_adapter *adapter)
++{
++	u8 *buf;
++	u32 len, type, id;
++	int ret, i;
++
++	buf = kzalloc(FW_DNLD_RX_BUF_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	memcpy(buf, "MRVL", 4);
++	buf[4] = 1;
++	len = XBOX_MRVL_MSG_LEN;
++	ret = mwifiex_write_data_sync(adapter, buf, &len,
++				      MWIFIEX_USB_EP_CMD_EVENT, 1000);
++	if (ret)
++		goto out;
++
++	/* ack first, then the init-done event */
++	ret = -ETIMEDOUT;
++	for (i = 0; i < 3; i++) {
++		len = FW_DNLD_RX_BUF_SIZE;
++		if (mwifiex_read_data_sync(adapter, buf, &len,
++					   MWIFIEX_USB_EP_CMD_EVENT, 3000))
++			break;
++		if (len < 8)
++			continue;
++		type = le32_to_cpup((__le32 *)buf);
++		id = le32_to_cpup((__le32 *)(buf + 4));
++		if (type == MWIFIEX_USB_TYPE_EVENT &&
++		    id == XBOX_EVENT_INIT_DONE) {
++			ret = 0;
++			break;
++		}
++	}
++out:
++	kfree(buf);
++	return ret;
++}
++
+ static int mwifiex_usb_dnld_fw(struct mwifiex_adapter *adapter,
+ 			struct mwifiex_fw_image *fw)
+ {
+ 	int ret;
+ 	struct usb_card_rec *card = (struct usb_card_rec *)adapter->card;
+ 
++	if (card->usb_boot_state == USB8XXX_FW_DNLD && adapter->no_fw_file) {
++		/* Xbox adapter: boot ROM or already running? */
++		ret = mwifiex_usb_xbox_probe(adapter);
++		if (ret < 0) {
++			mwifiex_dbg(adapter, ERROR,
++				    "Xbox adapter state probe failed: %d\n",
++				    ret);
++			return -1;
++		}
++		mwifiex_dbg(adapter, MSG, "info: Xbox adapter is %s\n",
++			    ret ? "in boot ROM mode" : "already running");
++		if (ret) {
++			ret = mwifiex_usb_xbox_boot(adapter);
++			if (ret) {
++				mwifiex_dbg(adapter, ERROR,
++					    "Xbox adapter MRVL boot failed: %d\n",
++					    ret);
++				return -1;
++			}
++			mwifiex_dbg(adapter, MSG,
++				    "info: Xbox adapter booted its flash firmware\n");
++		}
++		/* The USB ID never changes, so go straight to runtime. */
++		card->usb_boot_state = USB8XXX_FW_READY;
++	}
++
+ 	if (card->usb_boot_state == USB8XXX_FW_DNLD) {
+ 		ret = mwifiex_prog_fw_w_helper(adapter, fw);
+ 		if (ret)
+--- a/drivers/net/wireless/marvell/mwifiex/usb.h
++++ b/drivers/net/wireless/marvell/mwifiex/usb.h
+@@ -22,6 +22,8 @@
+ #define USB8997_PID_1		0x2052
+ #define USB8997_PID_2		0x204e
+ 
++#define MS_XBOX_VID		0x045e
++#define USB8786_PID_1		0x0765
+ 
+ 
+ #define USB8XXX_FW_DNLD		1
+@@ -38,6 +40,7 @@
+ #define USB8801_DEFAULT_FW_NAME	"mrvl/usb8801_uapsta.bin"
+ #define USB8997_DEFAULT_FW_NAME	"mrvl/usbusb8997_combo_v4.bin"
+ 
++#define USB8786_DEFAULT_FW_NAME	"mrvl/usb8786_uapsta.bin"
+ 
+ #define FW_DNLD_TX_BUF_SIZE	620
+ #define FW_DNLD_RX_BUF_SIZE	2048
+--- a/drivers/net/wireless/marvell/mwifiex/sta_cmd.c
++++ b/drivers/net/wireless/marvell/mwifiex/sta_cmd.c
+@@ -2444,8 +2444,15 @@
+ 					       HostCmd_CMD_802_11_PS_MODE_ENH,
+ 					       EN_AUTO_PS, BITMAP_STA_PS, NULL,
+ 					       true);
+-			if (ret)
+-				return -1;
++			if (ret) {
++				/* Some firmware (Xbox 360 88W8786U) rejects STA
++				 * power save: keep running with it disabled.
++				 */
++				mwifiex_dbg(priv->adapter, ERROR,
++					    "firmware rejected IEEE PS, continuing without it\n");
++				priv->adapter->ps_mode =
++					MWIFIEX_802_11_POWER_MODE_CAM;
++			}
+ 		}
+ 
+ 		if (drcs) {
+@@ -2502,7 +2509,8 @@
+ 				       EN_AUTO_PS, BITMAP_AUTO_DS,
+ 				       &auto_ds, true);
+ 		if (ret)
+-			return -1;
++			mwifiex_dbg(priv->adapter, ERROR,
++				    "firmware rejected auto deep sleep, continuing without it\n");
+ 	}
+ 
+ 	if (priv->bss_type != MWIFIEX_BSS_TYPE_UAP) {
+--- a/drivers/net/wireless/marvell/mwifiex/cfg80211.c
++++ b/drivers/net/wireless/marvell/mwifiex/cfg80211.c
+@@ -3111,8 +3111,12 @@
+ 
+ 		ret = mwifiex_send_cmd(priv, HostCmd_CMD_SET_BSS_MODE,
+ 				       HostCmd_ACT_GEN_SET, 0, NULL, true);
+-		if (ret)
+-			goto err_set_bss_mode;
++		if (ret) {
++			/* The Xbox 360 88W8786U firmware lacks this command */
++			mwifiex_dbg(adapter, ERROR,
++				    "firmware rejected SET_BSS_MODE, continuing\n");
++			ret = 0;
++		}
+ 
+ 		ret = mwifiex_sta_init_cmd(priv, false);
+ 		if (ret)
+@@ -3201,7 +3205,6 @@
+ 	free_netdev(dev);
+ 	priv->netdev = NULL;
+ err_sta_init:
+-err_set_bss_mode:
+ err_alloc_netdev:
+ 	memset(&priv->wdev, 0, sizeof(priv->wdev));
+ 	priv->wdev.iftype = NL80211_IFTYPE_UNSPECIFIED;
+--- a/drivers/net/wireless/marvell/mwifiex/main.c
++++ b/drivers/net/wireless/marvell/mwifiex/main.c
+@@ -542,7 +542,7 @@
+ 	struct wireless_dev *wdev;
+ 	struct completion *fw_done = adapter->fw_done;
+ 
+-	if (!firmware) {
++	if (!firmware && !adapter->no_fw_file) {
+ 		mwifiex_dbg(adapter, ERROR,
+ 			    "Failed to get firmware %s\n", adapter->fw_name);
+ 		goto err_dnld_fw;
+@@ -550,8 +550,10 @@
+ 
+ 	memset(&fw, 0, sizeof(struct mwifiex_fw_image));
+ 	adapter->firmware = firmware;
+-	fw.fw_buf = (u8 *) adapter->firmware->data;
+-	fw.fw_len = adapter->firmware->size;
++	if (firmware) {
++		fw.fw_buf = (u8 *) firmware->data;
++		fw.fw_len = firmware->size;
++	}
+ 
+ 	if (adapter->if_ops.dnld_fw) {
+ 		ret = adapter->if_ops.dnld_fw(adapter, &fw);
+@@ -695,11 +697,29 @@
+  * This function gets the firmware and (if called asynchronously) kicks off the
+  * HW init when done.
+  */
++static void mwifiex_nofw_work(struct work_struct *work)
++{
++	struct mwifiex_adapter *adapter =
++		container_of(work, struct mwifiex_adapter, nofw_work);
++
++	mwifiex_fw_dpc(NULL, adapter);
++}
++
+ static int mwifiex_init_hw_fw(struct mwifiex_adapter *adapter,
+ 			      bool req_fw_nowait)
+ {
+ 	int ret;
+ 
++	/* adapters running their own firmware need no file */
++	if (adapter->no_fw_file) {
++		adapter->firmware = NULL;
++		if (req_fw_nowait) {
++			INIT_WORK(&adapter->nofw_work, mwifiex_nofw_work);
++			schedule_work(&adapter->nofw_work);
++		}
++		return 0;
++	}
++
+ 	/* Override default firmware with manufacturing one if
+ 	 * manufacturing mode is enabled
+ 	 */
+--- a/drivers/net/wireless/marvell/mwifiex/main.h
++++ b/drivers/net/wireless/marvell/mwifiex/main.h
+@@ -856,6 +856,8 @@
+ 	struct mwifiex_private *priv[MWIFIEX_MAX_BSS_NUM];
+ 	u8 priv_num;
+ 	const struct firmware *firmware;
++	bool no_fw_file;	/* adapter runs its own firmware */
++	struct work_struct nofw_work;
+ 	char fw_name[32];
+ 	int winner;
+ 	struct device *dev;
